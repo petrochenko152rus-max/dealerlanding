@@ -1,0 +1,19 @@
+{
+  "name": "stool-group-dealer-landing",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Дилерская программа Stool Group / Moderli",
+  "engines": {
+    "node": ">=24.5"
+  },
+  "scripts": {
+    "start": "node --use-env-proxy --env-file-if-exists=.env server.mjs",
+    "dev": "node --watch --use-env-proxy --env-file-if-exists=.env server.mjs",
+    "test": "node --test",
+    "mail:check": "node --env-file-if-exists=.env scripts/check-mail.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "10.3.0"
+  }
+}
