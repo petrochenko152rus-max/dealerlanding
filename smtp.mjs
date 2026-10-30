@@ -35,12 +35,12 @@ export function smtpConfigured(env) {
   try { smtpOptions(env); return true; } catch { return false; }
 }
 
-export function createSmtpSender(env, transportFactory = nodemailer.createTransport) {
+export function createSmtpSender(env, transportFactory = nodemailer.createTransport, { delay = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   const options = smtpOptions(env);
   const transport = transportFactory(options);
   const domain = mailbox(env.MAIL_FROM).split('@')[1];
   return async (message, key) => {
-    const info = await transport.sendMail({
+    const mail = {
       from: env.MAIL_FROM,
       to: message.to,
       replyTo: message.reply_to,
@@ -50,7 +50,19 @@ export function createSmtpSender(env, transportFactory = nodemailer.createTransp
       attachments: (message.attachments ?? []).map(file => ({ filename: file.filename, content: Buffer.from(file.content, 'base64'), contentType: file.content_type })),
       disableFileAccess: true,
       disableUrlAccess: true,
-    });
+    };
+    let info;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        info = await transport.sendMail(mail);
+        break;
+      } catch (error) {
+        // Retry only an explicit temporary SMTP rejection. An ambiguous
+        // disconnect might have happened after acceptance, so do not retry it.
+        if (!Number.isInteger(error?.responseCode) || error.responseCode < 400 || error.responseCode >= 500 || attempt >= 2) throw error;
+        await delay((attempt + 1) * 1000);
+      }
+    }
     const accepted = (info?.accepted ?? []).map(item => (typeof item === 'string' ? item : item?.address)?.toLowerCase());
     if ((info?.rejected?.length ?? 0) || !message.to.every(address => accepted.includes(address.toLowerCase()))) throw new Error('SMTP server did not accept every recipient.');
   };

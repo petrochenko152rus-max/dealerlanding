@@ -2,15 +2,17 @@ const $ = (selector) => document.querySelector(selector);
 const form = $('#dealer-form');
 const formats = {
   online: { title: 'Интернет-магазин', icon: 'store', condition: 'От 100 SKU на сайте · закупка от 1 единицы', price: 'Действующая опт' },
-  showroom: { title: 'Салон / шоурум', icon: 'chair', condition: 'От 5 разных моделей на экспозиции · до 20% на выставочные образцы', price: 'Действующая опт' },
-  project: { title: 'Проектная организация', icon: 'project', condition: 'Без размещения · ориентир от 300 000 ₽ в квартал', price: 'Действующая опт + 10%' },
+  showroom: { title: 'Салон / шоурум', icon: 'chair', condition: 'От 5 разных моделей на экспозиции · скидка до 20% на образцы рассчитывается отдельно для каждого артикула', price: 'Действующая опт' },
+  project: { title: 'Проектная / комплектующая организация', icon: 'project', condition: 'Без размещения · ориентир от 300 000 ₽ в квартал', price: 'Действующая опт + 10%' },
 };
 let selectedType = 'online';
 let companyFile = null;
 let photos = [];
+let projects = [];
 let submitting = false;
 const companyInput = $('#company-file');
 const photoInput = $('#store-photos');
+const projectInput = $('#project-files');
 const errorBox = $('#form-error');
 
 function setFormat(type) {
@@ -26,15 +28,17 @@ function setFormat(type) {
   $('#summary-condition').textContent = format.condition;
   $('#summary-price').textContent = format.price;
   const website = form.elements.website;
-  $('#website-field').firstChild.textContent = type === 'online' ? 'Сайт магазина *' : 'Сайт компании / необязательно';
-  website.required = type === 'online';
+  $('#website-label').textContent = type === 'online' ? 'Сайт магазина *' : type === 'project' ? 'Сайт компании или завершённые проекты *' : 'Сайт компании / необязательно';
+  $('#website-hint').hidden = type !== 'project';
   $('#address-field').hidden = type !== 'showroom';
   form.elements.address.required = type === 'showroom';
   $('#photos-field').hidden = type !== 'showroom';
+  $('#projects-field').hidden = type !== 'project';
   photoInput.required = type === 'showroom';
   form.elements.termsAccepted.checked = false;
   updateFileValidity();
   clearServerErrors();
+  window.dispatchEvent(new CustomEvent('dealer-partner-type-change', { detail: { type } }));
 }
 document.querySelectorAll('[name=partnerType]').forEach(radio => radio.addEventListener('change', () => setFormat(radio.value)));
 
@@ -73,12 +77,23 @@ form.addEventListener('input', event => {
     delete event.target.dataset.serverError;
     event.target.removeAttribute('aria-invalid');
   }
+  if (event.target === form.elements.website) updateFileValidity();
 });
 
 function updateFileValidity() {
   form.elements.requisites.required = !companyFile;
   form.elements.requisites.minLength = companyFile ? 0 : 10;
-  photoInput.setCustomValidity(selectedType === 'showroom' && photos.length < 2 ? 'Добавьте не менее двух фотографий магазина / шоурума.' : '');
+  const hasWebsite = Boolean(form.elements.website.value.trim());
+  form.elements.website.required = selectedType === 'online' || (selectedType === 'project' && projects.length === 0);
+  photoInput.required = selectedType === 'showroom';
+  projectInput.required = selectedType === 'project' && !hasWebsite;
+  const selectedFiles = selectedType === 'showroom' ? photos : selectedType === 'project' ? projects : [];
+  const total = [...(companyFile ? [companyFile] : []), ...selectedFiles].reduce((sum, file) => sum + file.size, 0);
+  const totalError = total > 7 * 1024 * 1024 ? 'Общий размер вложений не должен превышать 7 МБ.' : '';
+  photoInput.setCustomValidity(selectedType === 'showroom' ? (totalError || (photos.length < 2 ? 'Добавьте не менее двух фотографий магазина / шоурума.' : '')) : '');
+  projectInput.setCustomValidity(selectedType === 'project' ? (totalError || (!hasWebsite && !projects.length ? 'Укажите сайт компании или приложите завершённый проект.' : '')) : '');
+  if (totalError) fileError(totalError);
+  else if ($('#attachment-error').textContent === 'Общий размер вложений не должен превышать 7 МБ.') fileError('');
 }
 function fileError(message) {
   $('#attachment-error').textContent = message;
@@ -90,14 +105,15 @@ function fileType(file) {
   return ({ pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' })[extension] || '';
 }
 function validateFiles(list, purpose) {
-  if (list.length > (purpose === 'photo' ? 4 : 1)) return purpose === 'photo' ? 'Выберите не более 4 фотографий.' : 'Выберите один файл с реквизитами.';
+  if (list.length > (purpose === 'requisites' ? 1 : 4)) return purpose === 'photo' ? 'Выберите не более 4 фотографий.' : purpose === 'project' ? 'Выберите не более 4 файлов проектов.' : 'Выберите один файл с реквизитами.';
   for (const file of list) {
     const types = purpose === 'photo' ? ['image/jpeg', 'image/png', 'image/webp'] : ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
     if (!types.includes(fileType(file))) return `Файл «${file.name}»: выберите ${purpose === 'photo' ? 'JPG, PNG или WebP' : 'PDF, JPG, PNG или WebP'}.`;
     if (file.size > 2 * 1024 * 1024 || file.size === 0) return `Файл «${file.name}» должен быть не пустым и не больше 2 МБ.`;
     if (file.name.length > 150) return 'Сократите название файла до 150 символов.';
   }
-  const combined = purpose === 'photo' ? [...list, ...(companyFile ? [companyFile] : [])] : [...list, ...photos];
+  const activeFiles = selectedType === 'showroom' ? photos : selectedType === 'project' ? projects : [];
+  const combined = purpose === 'requisites' ? [...list, ...activeFiles] : [...list, ...(companyFile ? [companyFile] : [])];
   if (combined.reduce((sum, file) => sum + file.size, 0) > 7 * 1024 * 1024) return 'Общий размер вложений не должен превышать 7 МБ.';
   return '';
 }
@@ -114,7 +130,8 @@ function renderFiles() {
       remove.type = 'button'; remove.textContent = '×'; remove.setAttribute('aria-label', `Удалить ${file.name}`);
       remove.addEventListener('click', () => {
         if (purpose === 'requisites') { companyFile = null; companyInput.value = ''; }
-        else { photos.splice(index, 1); syncPhotoInput(); }
+        else if (purpose === 'photo') { photos.splice(index, 1); syncInput(photoInput, photos); }
+        else { projects.splice(index, 1); syncInput(projectInput, projects); }
         fileError(''); renderFiles(); updateFileValidity();
       });
       item.append(name, size, remove); element.append(item);
@@ -122,11 +139,12 @@ function renderFiles() {
   };
   render(companyFile ? [companyFile] : [], $('#company-file-list'), 'requisites');
   render(photos, $('#photo-file-list'), 'photo');
+  render(projects, $('#project-file-list'), 'project');
 }
-function syncPhotoInput() {
+function syncInput(input, files) {
   const transfer = new DataTransfer();
-  photos.forEach(file => transfer.items.add(file));
-  photoInput.files = transfer.files;
+  files.forEach(file => transfer.items.add(file));
+  input.files = transfer.files;
 }
 companyInput.addEventListener('change', () => {
   const list = Array.from(companyInput.files);
@@ -140,9 +158,17 @@ photoInput.addEventListener('change', () => {
   const list = [...photos];
   newFiles.forEach(file => { if (!list.some(existing => existing.name === file.name && existing.size === file.size && existing.lastModified === file.lastModified)) list.push(file); });
   const message = validateFiles(list, 'photo');
-  if (message) { syncPhotoInput(); fileError(message); return; }
+  if (message) { syncInput(photoInput, photos); fileError(message); return; }
   photos = list;
-  syncPhotoInput(); fileError(''); renderFiles(); updateFileValidity();
+  syncInput(photoInput, photos); fileError(''); renderFiles(); updateFileValidity();
+});
+projectInput.addEventListener('change', () => {
+  const list = [...projects];
+  Array.from(projectInput.files).forEach(file => { if (!list.some(existing => existing.name === file.name && existing.size === file.size && existing.lastModified === file.lastModified)) list.push(file); });
+  const message = validateFiles(list, 'project');
+  if (message) { syncInput(projectInput, projects); fileError(message); return; }
+  projects = list;
+  syncInput(projectInput, projects); fileError(''); renderFiles(); updateFileValidity();
 });
 
 async function attachment(file, purpose) {
@@ -159,6 +185,13 @@ form.addEventListener('submit', async event => {
   if (submitting) return;
   clearServerErrors(); updateFileValidity();
   if (!form.reportValidity()) return;
+  const cart = window.getPreorderSummary?.();
+  if (cart && cart.count > 0 && !cart.valid) {
+    errorBox.textContent = 'Не удалось подтвердить выбранные товары. Проверьте предварительный заказ в каталоге или удалите недоступные позиции.';
+    errorBox.hidden = false;
+    errorBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return;
+  }
   submitting = true;
   const button = form.querySelector('[type=submit]');
   button.disabled = true; button.querySelector('span').textContent = 'Отправляем заявку…';
@@ -168,10 +201,12 @@ form.addEventListener('submit', async event => {
     payload.type = selectedType;
     payload.termsAccepted = form.elements.termsAccepted.checked;
     payload.consent = form.elements.consent.checked;
+    payload.orderItems = window.getPreorderItems?.() ?? [];
     if (selectedType !== 'showroom') payload.address = '';
     payload.attachments = await Promise.all([
       ...(companyFile ? [attachment(companyFile, 'requisites')] : []),
       ...(selectedType === 'showroom' ? photos.map(file => attachment(file, 'photo')) : []),
+      ...(selectedType === 'project' ? projects.map(file => attachment(file, 'project')) : []),
     ]);
     const response = await fetch('/api/applications', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -192,7 +227,8 @@ form.addEventListener('submit', async event => {
     $('#success-panel').hidden = false;
     $('#success-panel').focus({ preventScroll: true });
     $('#success-panel').scrollIntoView({ behavior: 'smooth', block: 'center' });
-    form.reset(); companyFile = null; photos = []; renderFiles();
+    form.reset(); companyFile = null; photos = []; projects = []; renderFiles();
+    window.clearPreorderItems?.();
   } catch (error) {
     errorBox.textContent = ['TimeoutError', 'AbortError'].includes(error.name) ? 'Ответ от почты задерживается. Повторите отправку или свяжитесь с Семёном.' : error instanceof TypeError ? 'Нет связи с сервером. Проверьте подключение и попробуйте ещё раз.' : error.message;
     errorBox.hidden = false;
@@ -200,7 +236,7 @@ form.addEventListener('submit', async event => {
     if (invalid) invalid.focus(); else errorBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
   } finally {
     submitting = false; button.disabled = false;
-    button.querySelector('span').textContent = 'Отправить заявку и получить КП';
+    button.querySelector('span').textContent = 'Отправить заявку';
     form.removeAttribute('aria-busy');
   }
 });
@@ -210,3 +246,16 @@ $('#new-application').addEventListener('click', () => {
   form.elements.company.focus();
 });
 updateFileValidity();
+
+function updateOrderSummary(summary = window.getPreorderSummary?.()) {
+  const panel = $('#preorder-summary');
+  if (!panel) return;
+  panel.hidden = !summary?.count;
+  if (!panel.hidden) {
+    const count = new Intl.NumberFormat('ru-RU').format(summary.count);
+    const quantity = new Intl.NumberFormat('ru-RU').format(summary.quantity);
+    $('#preorder-summary-count').textContent = `${count} поз. · ${quantity} шт.`;
+  }
+}
+window.addEventListener('dealer-preorder-change', event => updateOrderSummary(event.detail));
+updateOrderSummary();

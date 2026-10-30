@@ -7,13 +7,30 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import nodemailer from 'nodemailer';
-import { smtpOptions } from '../smtp.mjs';
+import { smtpOptions, createSmtpSender } from '../smtp.mjs';
 import { createServer } from '../server.mjs';
 import { checkSmtp } from '../scripts/check-mail.mjs';
 
 const configured = { MAIL_TRANSPORT: 'smtp', SMTP_USER: 'dealers@example.org', SMTP_PASSWORD: 'local-test-password', MAIL_FROM: 'Stool Group <dealers@example.org>' };
-const valid = { type: 'project', contactName: 'Иван Иванов', email: 'client@example.org', phone: '+7 999 123-45-67', company: 'ООО Мебель', city: 'Москва', requisites: 'Расчётный счёт 1234567890', termsAccepted: true, consent: true };
+const valid = { type: 'project', contactName: 'Иван Иванов', email: 'client@example.org', phone: '+7 999 123-45-67', company: 'ООО Мебель', city: 'Москва', website: 'studio.example.org', requisites: 'Расчётный счёт 1234567890', termsAccepted: true, consent: true };
 const pdf = { name: 'company.pdf', type: 'application/pdf', purpose: 'requisites', data: Buffer.from('%PDF-1.4\nlocal test attachment').toString('base64') };
+
+test('temporary SMTP rejections retry; ambiguous disconnects are not retried', async () => {
+  let attempts = 0;
+  const waits = [];
+  const send = createSmtpSender(configured, () => ({ sendMail: async message => {
+    attempts++;
+    if (attempts < 3) throw Object.assign(new Error('temporary'), { responseCode: 451 });
+    return { accepted: message.to, rejected: [] };
+  }}), { delay: async ms => { waits.push(ms); } });
+  await send({ to: ['client@example.org'], subject: 'Test', text: 'Test' }, 'test-id');
+  assert.equal(attempts, 3);
+  assert.deepEqual(waits, [1000, 2000]);
+  let disconnects = 0;
+  const ambiguous = createSmtpSender(configured, () => ({ sendMail: async () => { disconnects++; throw Object.assign(new Error('connection lost'), { code: 'ECONNECTION' }); } }), { delay: async () => assert.fail('must not retry') });
+  await assert.rejects(ambiguous({ to: ['client@example.org'], subject: 'Test', text: 'Test' }, 'test-id'));
+  assert.equal(disconnects, 1);
+});
 
 async function appFor(t, options = {}) {
   const server = createServer({ env: configured, ...options });
@@ -51,7 +68,8 @@ test('Nodemailer factory receives secure options and manager/client payloads map
   assert.equal(sent[0].replyTo, valid.email);
   assert.equal(sent[1].replyTo, 'petrochenko_s@stoolgroup.ru');
   assert.deepEqual(sent[1].to, [valid.email]);
-  assert.match(sent[1].text, /100 SKU/);
+  assert.match(sent[1].text, /заявку по формату.*получили/i);
+  assert.match(sent[1].text, /скоро свяжусь с вами/i);
   assert.equal(Buffer.isBuffer(sent[0].attachments[0].content), true);
   assert.equal(sent[0].attachments[0].content.toString(), Buffer.from(pdf.data, 'base64').toString());
   assert.equal(sent[0].attachments[0].contentType, 'application/pdf');

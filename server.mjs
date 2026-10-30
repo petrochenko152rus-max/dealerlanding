@@ -4,6 +4,8 @@ import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createSmtpSender, smtpConfigured } from './smtp.mjs';
+import { startCatalogSync } from './catalog-sync.mjs';
+import { readCatalog, parseOrderItems, resolveOrderItems, CatalogInputError, CatalogUnavailable } from './catalog.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('./public', import.meta.url)));
 const RECIPIENT = 'petrochenko_s@stoolgroup.ru';
@@ -32,7 +34,7 @@ export const OFFER = `Добрый день!
 
 Салоны / шоурумы
 • Необходимо разместить от 5 моделей (разных артикулов) на экспозицию.
-• Дополнительная скидка до 20% на выставочные образцы. Скидка на экспозицию рассчитывается индивидуально к каждому артикулу товара.
+• Дополнительная скидка до 20% на выставочные образцы рассчитывается отдельно, индивидуально для каждого артикула.
 • Ваша цена в прайс-листе — «Действующая опт».
 
 Проектные / комплектующие организации
@@ -54,7 +56,7 @@ export const OFFER = `Добрый день!
 
 ДЛЯ СТАРТА РАБОТЫ НЕОБХОДИМО ПРИСЛАТЬ
 1. Реквизиты компании — подготовим договор. Работаем с юридическими лицами с НДС и без НДС, стоимость товара не меняется.
-2. Адрес и несколько фотографий вашего магазина или ссылки на интернет-магазин.
+2. Для салона / шоурума — адрес и несколько фотографий магазина; для интернет-магазина — ссылка на сайт; для проектной / комплектующей организации — сайт или файлы завершённых проектов.
 
 Если условия подходят, присылайте реквизиты — подключим вас к дилерской программе.
 
@@ -119,7 +121,7 @@ function validate(input) {
   if (!Array.isArray(files) || files.length > 5) throw new RequestError(422, 'Можно приложить не более 5 файлов.');
   let total = 0;
   data.attachments = files.map(file => {
-    if (!file || typeof file !== 'object' || !['requisites', 'photo'].includes(file.purpose) || typeof file.type !== 'string' || typeof file.name !== 'string' || file.name.length > 150 || /[\u0000-\u001f\u007f/\\]/.test(file.name) || !file.name.trim() || typeof file.data !== 'string' || !file.data.length || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(file.data)) throw new RequestError(422, 'Некорректный файл вложения.');
+    if (!file || typeof file !== 'object' || !['requisites', 'photo', 'project'].includes(file.purpose) || typeof file.type !== 'string' || typeof file.name !== 'string' || file.name.length > 150 || /[\u0000-\u001f\u007f/\\]/.test(file.name) || !file.name.trim() || typeof file.data !== 'string' || !file.data.length || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(file.data)) throw new RequestError(422, 'Некорректный файл вложения.');
     const buffer = Buffer.from(file.data, 'base64');
     const allowed = {
       'application/pdf': buffer.subarray(0, 5).toString() === '%PDF-',
@@ -136,6 +138,7 @@ function validate(input) {
   });
   if (data.requisites.length < 10 && !data.attachments.some(file => file.purpose === 'requisites')) throw new RequestError(422, 'Укажите реквизиты компании (не менее 10 символов) или приложите файл с реквизитами.', { requisites: 'Нужны реквизиты компании или файл с реквизитами.' });
   if (data.type === 'showroom' && data.attachments.filter(file => file.purpose === 'photo').length < 2) throw new RequestError(422, 'Приложите не менее двух фотографий магазина / шоурума.', { attachments: 'Нужны минимум две фотографии магазина / шоурума.' });
+  if (data.type === 'project' && !data.website && !data.attachments.some(file => file.purpose === 'project')) throw new RequestError(422, 'Укажите сайт компании или приложите хотя бы один файл завершённого проекта.');
   return data;
 }
 
@@ -154,8 +157,35 @@ async function readJSON(req) {
 }
 
 function managerText(data) {
-  const fileList = data.attachments.map(file => `• ${file.filename} — ${file.purpose === 'requisites' ? 'реквизиты компании' : 'фотография магазина'}`).join('\n');
-  return `Новая заявка в дилерскую программу Stool Group / Moderli\n\nФормат: ${TYPES[data.type]}\nКомпания: ${data.company}\nИНН: ${data.inn || 'не указан'}\nКонтакт: ${data.contactName}\nEmail: ${data.email}\nТелефон: ${data.phone}\nГород: ${data.city}\nСайт: ${data.website || 'не указан'}\nАдрес: ${data.address || 'не указан'}\n\nРеквизиты:\n${data.requisites || 'во вложении'}\n\nКомментарий:\n${data.comment || 'нет'}\n\nУсловия выбранного формата подтверждены. Согласие на обработку персональных данных получено.\nВложения: ${data.attachments.length}.\n${fileList}\n\nУсловия программы:\n${OFFER}`;
+  const fileList = data.attachments.map(file => `• ${file.filename} — ${file.purpose === 'requisites' ? 'реквизиты компании' : file.purpose === 'project' ? 'завершённый проект' : 'фотография магазина'}`).join('\n');
+  const price = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? `${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(value)} ₽`
+    : 'уточняется';
+  // The handler must resolve each item from the server-side catalog, never from
+  // client-submitted names or prices, before calling this formatter.
+  const order = Array.isArray(data.orderItems) && data.orderItems.length
+    ? `\n\nПРЕДВАРИТЕЛЬНЫЙ ЗАКАЗ (не является резервом)\n${data.orderItems.map(item => `• ${item.name} · артикул ${item.article || item.sku}${item.article ? ` · код ${item.sku}` : ''} · ${item.quantity} шт.\n  РРЦ действующая: ${price(item.retailPrice)}; опт действующая (базовая колонка): ${price(item.wholesalePrice)}`).join('\n')}\nЦены и остатки уточняются менеджером; условия выбранного формата применяются отдельно.`
+    : '';
+  return `Новая заявка в дилерскую программу Stool Group / Moderli\n\nФормат: ${TYPES[data.type]}\nКомпания: ${data.company}\nИНН: ${data.inn || 'не указан'}\nКонтакт: ${data.contactName}\nEmail: ${data.email}\nТелефон: ${data.phone}\nГород: ${data.city}\nСайт: ${data.website || 'не указан'}\nАдрес: ${data.address || 'не указан'}${order}\n\nРеквизиты:\n${data.requisites || 'во вложении'}\n\nКомментарий:\n${data.comment || 'нет'}\n\nУсловия выбранного формата подтверждены. Согласие на обработку персональных данных получено.\nВложения: ${data.attachments.length}.\n${fileList}\n\nУсловия программы:\n${OFFER}`;
+}
+
+// Never manufacture a public link from the local request Host header. Only an
+// explicitly configured HTTPS site address may appear in an outgoing email.
+function publicSiteUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048 || /[\x00-\x20\x7f]/.test(value)) return null;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== 'https:' || url.username || url.password || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i.test(host)) return null;
+    if (/^\d+(?:\.\d+){3}$/.test(host) || /\.(?:localhost|local|internal|invalid|test|example)$/.test(host)) return null;
+    return url.href;
+  } catch { return null; }
+}
+
+function confirmationText(data, env) {
+  const url = publicSiteUrl(env.PUBLIC_SITE_URL);
+  const site = url ? `\n\nУсловия сотрудничества и каталог: ${url}` : '';
+  return `${data.contactName}, добрый день!\n\nСпасибо за интерес к сотрудничеству со Stool Group / Moderli.\n\nВашу заявку по формату «${TYPES[data.type]}» получили. Я изучу информацию и скоро свяжусь с вами, чтобы обсудить дальнейшие шаги.${site}\n\nАктуальные прайс-листы и остатки:\nhttps://cloud.mail.ru/public/ED7Y/Ep5TKqaGm\n\nЕсли у вас появились вопросы, ответьте на это письмо или позвоните мне.\n\nС уважением,\nСемён Петроченко\nРуководитель отдела развития Stool Group / Moderli\n+7 926 009-01-50\npetrochenko_s@stoolgroup.ru`;
 }
 
 async function sendMail(fetchImpl, env, message, key) {
@@ -168,7 +198,7 @@ async function sendMail(fetchImpl, env, message, key) {
   if (!response.ok) throw new Error('Mail provider did not accept the message.');
 }
 
-export function createServer({ env = process.env, fetchImpl = globalThis.fetch, smtpTransportFactory, publicDir = ROOT, now = Date.now } = {}) {
+export function createServer({ env = process.env, fetchImpl = globalThis.fetch, smtpTransportFactory, publicDir = ROOT, catalogPath, now = Date.now } = {}) {
   const attempts = new Map();
   // Retain hashes and delivery stages only; retries across processes or restarts
   // still require external delivery tracking if stronger guarantees are needed.
@@ -191,7 +221,7 @@ export function createServer({ env = process.env, fetchImpl = globalThis.fetch, 
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://stoolgroup.ru https://www.stoolgroup.ru; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     const json = (status, value) => {
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(value));
@@ -199,6 +229,10 @@ export function createServer({ env = process.env, fetchImpl = globalThis.fetch, 
     try {
       const pathname = new URL(req.url, 'http://localhost').pathname;
       if (pathname === '/api/health' && req.method === 'GET') return json(200, { status: 'ok', mailConfigured: mailConfigured(env) });
+      if (pathname === '/api/catalog' && req.method === 'GET') {
+        const { products, updatedAt } = await readCatalog(catalogPath);
+        return json(200, { products, updatedAt });
+      }
       if (pathname === '/api/applications' && req.method === 'POST') {
         if (req.headers['sec-fetch-site'] === 'cross-site') throw new RequestError(403, 'Отправьте заявку со страницы сайта.');
         const timestamp = now();
@@ -212,7 +246,12 @@ export function createServer({ env = process.env, fetchImpl = globalThis.fetch, 
           res.setHeader('Retry-After', '900');
           throw new RequestError(429, 'Слишком много попыток. Повторите через 15 минут или свяжитесь с нами по телефону.');
         }
-        const data = validate(await readJSON(req));
+        const input = await readJSON(req);
+        const data = validate(input);
+        const items = parseOrderItems(input.orderItems);
+        // Only authoritative server-side catalog names and prices may enter
+        // email or idempotency state; client price/name fields are ignored.
+        data.orderItems = items.length ? resolveOrderItems(items, await readCatalog(catalogPath)) : [];
         if (!mailConfigured(env)) throw new RequestError(503, 'Отправка заявок пока не подключена. Напишите Семёну: petrochenko_s@stoolgroup.ru или позвоните +7 926 009-01-50.');
         const id = createHash('sha256').update(JSON.stringify(data)).digest('hex');
         const stage = smtpMode ? stageFor(id) : { managerSent: false, clientSent: false };
@@ -225,15 +264,21 @@ export function createServer({ env = process.env, fetchImpl = globalThis.fetch, 
             stage.managerSent = true;
           }
           if (!stage.clientSent) {
-            await send({ to: [data.email], reply_to: RECIPIENT, subject: 'Условия дилерского сотрудничества · Stool Group / Moderli', text: `${data.contactName}, спасибо за интерес к нашей дилерской программе!\nВы выбрали формат: ${TYPES[data.type]}. Ваша заявка передана Семёну.\n\n${OFFER}` }, `dealer-client-${id}`);
+            await send({ to: [data.email], reply_to: RECIPIENT, subject: 'Ваша заявка получена · Stool Group / Moderli', text: confirmationText(data, env) }, `dealer-client-${id}`);
             stage.clientSent = true;
           }
-        } catch {
-          throw new RequestError(502, stage.managerSent ? 'Заявка передана Семёну, но письмо с условиями не удалось отправить вам. Повторите отправку или свяжитесь с Семёном.' : 'Не удалось передать заявку. Повторите позже или напишите на petrochenko_s@stoolgroup.ru.');
+        } catch (error) {
+          // Mail provider responses can contain addresses and credentials.
+          // Log only an allowlisted error category and numeric SMTP status.
+          const allowedCodes = new Set(['EAUTH', 'ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'EDNS', 'EENVELOPE', 'EMESSAGE', 'EPROTOCOL', 'ETLS', 'ECONFIG']);
+          const code = allowedCodes.has(error?.code) ? error.code : 'UNKNOWN';
+          const status = Number.isInteger(error?.responseCode) && error.responseCode >= 400 && error.responseCode <= 599 ? ` SMTP ${error.responseCode}` : '';
+          console.error(`Ошибка почты (${stage.managerSent ? 'подтверждение' : 'заявка'}): ${code}${status}`);
+          throw new RequestError(502, stage.managerSent ? 'Заявка передана Семёну, но письмо с подтверждением не удалось отправить вам. Повторите отправку или свяжитесь с Семёном.' : 'Не удалось передать заявку. Повторите позже или напишите на petrochenko_s@stoolgroup.ru.');
         } finally {
           stage.sending = false;
         }
-        return json(200, { success: true, message: 'Заявка передана Семёну. Коммерческое предложение отправлено на вашу почту.' });
+        return json(200, { success: true, message: 'Заявка передана Семёну. Подтверждение отправлено на вашу почту.' });
       }
       if (pathname.startsWith('/api/')) throw new RequestError(404, 'Не найдено.');
       if (!['GET', 'HEAD'].includes(req.method)) throw new RequestError(405, 'Метод не поддерживается.');
@@ -254,7 +299,8 @@ export function createServer({ env = process.env, fetchImpl = globalThis.fetch, 
       res.end(req.method === 'HEAD' ? undefined : file);
     } catch (error) {
       if (res.headersSent) return res.end();
-      json(error instanceof RequestError ? error.status : 500, { success: false, message: error instanceof RequestError ? error.message : 'Внутренняя ошибка. Попробуйте позже.', ...(error.fields ? { fields: error.fields } : {}) });
+      const expected = error instanceof RequestError || error instanceof CatalogUnavailable || error instanceof CatalogInputError;
+      json(expected ? error.status : 500, { success: false, message: expected ? error.message : 'Внутренняя ошибка. Попробуйте позже.', ...(error.fields ? { fields: error.fields } : {}) });
     }
   });
   server.requestTimeout = 30_000;
@@ -265,6 +311,8 @@ export function createServer({ env = process.env, fetchImpl = globalThis.fetch, 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 3000);
   const server = createServer();
+  const stopCatalogSync = startCatalogSync();
+  server.on('close', stopCatalogSync);
   server.listen(port, process.env.HOST || '0.0.0.0', () => {
     console.log(`Dealer landing listening on port ${port}. Mail ${mailConfigured(process.env) ? 'configured' : 'not configured'}.`);
   });

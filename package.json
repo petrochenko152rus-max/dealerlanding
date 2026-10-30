@@ -11,6 +11,7 @@
     "start": "node --use-env-proxy --env-file-if-exists=.env server.mjs",
     "dev": "node --watch --use-env-proxy --env-file-if-exists=.env server.mjs",
     "test": "node --test",
+    "test:catalog": "python3 -m unittest discover -s test -p test_catalog_sync.py",
     "mail:check": "node --env-file-if-exists=.env scripts/check-mail.mjs"
   },
   "dependencies": {

@@ -4,3 +4,6 @@
 node_modules/
 coverage/
 *.log
+data/source-cache/
+data/.catalog-sync.lock
+__pycache__/

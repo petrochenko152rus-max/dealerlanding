@@ -18,7 +18,7 @@ async function setup(t, options = {}) {
   return { url, submit: body => fetch(`${url}/api/applications`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) };
 }
 
-test('application sends manager details/attachments and full commercial offer to client', async t => {
+test('application sends manager details and a receipt confirmation to the client', async t => {
   const sent = [];
   const app = await setup(t, { env: configured, fetchImpl: async (url, options) => { sent.push({ url, options, body: JSON.parse(options.body) }); return { ok: true }; } });
   const pdf = { name: 'requisites.pdf', type: 'application/pdf', purpose: 'requisites', data: Buffer.from('%PDF-1.4\nfixture').toString('base64') };
@@ -33,11 +33,36 @@ test('application sends manager details/attachments and full commercial offer to
   assert.equal(sent[0].body.attachments[0].purpose, undefined);
   assert.match(sent[0].body.text, /requisites.pdf — реквизиты компании/);
   assert.deepEqual(sent[1].body.to, [valid.email]);
-  assert.ok(sent[1].body.text.includes(OFFER));
+  assert.match(sent[1].body.subject, /заявка получена/i);
+  assert.match(sent[1].body.text, /заявку по формату.*получили/i);
+  assert.match(sent[1].body.text, /скоро свяжусь с вами/i);
+  assert.match(sent[1].body.text, /cloud\.mail\.ru\/public\/ED7Y\/Ep5TKqaGm/);
+  assert.equal(sent[1].body.text.includes(OFFER), false);
+  assert.doesNotMatch(sent[1].body.text, /127\.0\.0\.1|localhost|ССЫЛКА НА ЛЕНДИНГ/);
   assert.match(OFFER, /100 SKU/);
   assert.match(OFFER, /300 000 ₽/);
   assert.match(OFFER, /до 20%/);
+  assert.match(OFFER, /рассчитывается отдельно, индивидуально для каждого артикула/);
   assert.equal(sent[0].options.headers['Idempotency-Key'].length, 79);
+});
+
+test('confirmation includes only a configured public HTTPS landing URL', async t => {
+  for (const [configuredUrl, expectedUrl] of [
+    ['https://dealer.stoolgroup.ru/', 'https://dealer.stoolgroup.ru/'],
+    ['', null],
+    ['http://dealer.stoolgroup.ru/', null],
+    ['https://localhost:3000/', null],
+    ['https://127.0.0.1/', null],
+    ['https://example.test/', null],
+    ['https://user:pass@dealer.stoolgroup.ru/', null],
+  ]) {
+    const sent = [];
+    const app = await setup(t, { env: { ...configured, PUBLIC_SITE_URL: configuredUrl }, fetchImpl: async (_url, options) => { sent.push(JSON.parse(options.body)); return { ok: true }; } });
+    assert.equal((await app.submit(valid)).status, 200);
+    const confirmation = sent[1].text;
+    if (expectedUrl) assert.ok(confirmation.includes(expectedUrl));
+    else assert.doesNotMatch(confirmation, /Условия сотрудничества и каталог:/);
+  }
 });
 
 test('format-specific requirements and consent are enforced before sending', async t => {
@@ -49,11 +74,11 @@ test('format-specific requirements and consent are enforced before sending', asy
   assert.equal(sends, 0);
 });
 
-test('showroom address and project without a website are accepted', async t => {
+test('showroom address and project with a website are accepted', async t => {
   const app = await setup(t, { env: configured, fetchImpl: async () => ({ ok: true }) });
   const photo = name => ({ name, type: 'image/jpeg', purpose: 'photo', data: Buffer.from([0xff, 0xd8, 0xff, 0xe0]).toString('base64') });
   assert.equal((await app.submit({ ...valid, type: 'showroom', address: 'Москва, улица Ленина, 1', website: '', attachments: [photo('front.jpg'), photo('inside.jpg')] })).status, 200);
-  assert.equal((await app.submit({ ...valid, type: 'project', website: '' })).status, 200);
+  assert.equal((await app.submit({ ...valid, type: 'project', website: 'studio.example.org' })).status, 200);
 });
 
 test('company requisites and at least two showroom photos are required', async t => {
